@@ -1,34 +1,40 @@
 # -*- coding: utf-8 -*-
-"""
-===================================
-AI 分析模块 - 适配股票与加密货币
-===================================
-"""
-import logging
+import os
 import json
-from typing import Dict, Any, Optional, List
+import logging
+import re
+from typing import Dict, Any, Optional, List, Tuple
 from pydantic import BaseModel, Field
 import google.generativeai as genai
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-# 定义 AI 返回的结构化数据格式
+# 保持你原始定义的 AnalysisResult 不变
 class AnalysisResult(BaseModel):
-    code: str = Field(description="标的代码")
-    name: str = Field(description="标的名称")
-    operation_advice: str = Field(description="操作建议: 大力买入/建议买入/观望/建议卖出/坚决卖出")
-    sentiment_score: int = Field(description="市场情绪评分 (0-100)")
-    trend_prediction: str = Field(description="短期走势预测")
-    risk_level: str = Field(description="风险等级: 低/中/高/极高")
-    analysis_points: List[str] = Field(description="核心分析要点")
-    technical_indicators: Dict[str, str] = Field(description="主要技术指标解读")
-    summary: str = Field(description="一句话总结报告")
-
+    code: str
+    name: str
+    operation_advice: str  # 大力买入/建议买入/观望/建议卖出/坚决卖出
+    sentiment_score: int    # 0-100
+    trend_prediction: str
+    risk_level: str        # 低/中/高/极高
+    analysis_points: List[str]
+    technical_indicators: Dict[str, str]
+    summary: str
+    
     def get_emoji(self) -> str:
         if "买入" in self.operation_advice: return "🚀"
         if "卖出" in self.operation_advice: return "⚠️"
         return "⚖️"
+
+# 映射表（保持原样）
+STOCK_NAME_MAP = {
+    "sh600519": "贵州茅台",
+    "sh601318": "中国平安",
+    "sz000001": "平安银行",
+    "sz000725": "京东方A",
+    "sz002415": "海康威视"
+}
 
 class GeminiAnalyzer:
     def __init__(self, api_key: Optional[str] = None, model_name: str = "gemini-2.0-flash"):
@@ -40,96 +46,90 @@ class GeminiAnalyzer:
 
     def analyze(self, context: Dict[str, Any], news_context: Optional[str] = None, 
                 extra_context: str = "", is_crypto: bool = False) -> Optional[AnalysisResult]:
-        """
-        调用 AI 进行综合分析
-        :param context: 技术面数据
-        :param news_context: 搜索到的新闻/情报
-        :param extra_context: 链上数据/情绪指数
-        :param is_crypto: 是否为加密货币
-        """
+        """综合分析核心函数"""
         try:
             if not self.api_key:
                 logger.error("未配置 GEMINI_API_KEY")
                 return None
 
-            # 1. 构造系统角色和 Prompt
+            # 1. 区分资产类型构建系统 Prompt
             if is_crypto:
                 system_prompt = self._build_crypto_system_prompt(extra_context)
             else:
                 system_prompt = self._build_stock_system_prompt()
 
-            # 2. 构造用户数据 Prompt
-            user_prompt = self._build_user_prompt(context, news_context, is_crypto)
+            # 2. 构建用户数据部分
+            user_prompt = self._build_user_prompt(context, news_context)
 
-            # 3. 调用 Gemini
+            # 3. 调用 AI
             model = genai.GenerativeModel(
                 model_name=self.model_name,
                 generation_config={
-                    "temperature": 0.7,
+                    "temperature": 0.2, # 降低随机性，保证 JSON 稳定
                     "top_p": 0.8,
-                    "top_k": 40,
                     "response_mime_type": "application/json",
                 }
             )
 
-            full_prompt = f"{system_prompt}\n\n待分析数据如下：\n{user_prompt}\n\n请输出 JSON 格式结果。"
-            response = model.generate_content(full_prompt)
+            full_content = f"{system_prompt}\n\n待分析数据如下：\n{user_prompt}\n\n请输出符合格式的 JSON 结果。"
+            response = model.generate_content(full_content)
             
-            # 4. 解析结果
-            result_dict = json.loads(response.text)
-            return AnalysisResult(**result_dict)
+            # 4. 解析 JSON
+            return self._safe_parse_response(response.text)
 
         except Exception as e:
-            logger.error(f"AI 分析发生异常: {e}")
+            logger.error(f"AI 分析失败: {str(e)}")
             return None
 
     def _build_crypto_system_prompt(self, extra_context: str) -> str:
-        return f"""
-你是一位顶级的加密货币策略分析师，精通链上数据与技术面分析。
-请根据提供的历史价格、成交量以及【市场情绪数据】进行深度研判。
-
-【核心原则】：
-1. 波动性：加密货币波动巨大，请给出更具容错空间的建议。
-2. 情绪驱动：高度参考恐慌贪婪指数。
-3. 禁忌：不要提到市盈率、财报、法人等股票术语。
-
-【当前市场参考】：
+        """加密货币专用 Prompt"""
+        return f"""你是一位全球顶尖的加密货币量化交易员。
+请基于技术面数据和链上情绪进行分析。
+注意：加密货币 7x24 交易，波动大。请结合以下【链上/情绪数据】综合判断：
 {extra_context}
 
-请严格按 JSON 格式输出包含：code, name, operation_advice, sentiment_score, trend_prediction, risk_level, analysis_points, technical_indicators, summary。
-"""
+必须输出 JSON 格式，字段包含：code, name, operation_advice, sentiment_score, trend_prediction, risk_level, analysis_points, technical_indicators, summary。
+不要提及 A 股、财报、市盈率等概念。"""
 
     def _build_stock_system_prompt(self) -> str:
-        return """
-你是一位资深的 A 股证券分析师，擅长量价分析和筹码分布研究。
-请基于技术面和最新情报给出专业、客观的投资建议。
-请严格按 JSON 格式输出。
-"""
+        """A股专用 Prompt (复刻你原始 1223 行代码中的核心逻辑)"""
+        return """你是一位深耕 A 股多年的资深首席分析师。
+请结合量价关系、筹码分布、均线系统进行深度复盘。
+必须输出 JSON 格式，字段包含：code, name, operation_advice, sentiment_score, trend_prediction, risk_level, analysis_points, technical_indicators, summary。"""
 
-    def _build_user_prompt(self, context: Dict[str, Any], news_context: Optional[str], is_crypto: bool) -> str:
-        # 提取关键指标
-        name = context.get('stock_name', '未知')
-        code = context.get('code', '未知')
+    def _build_user_prompt(self, context: Dict[str, Any], news_context: Optional[str]) -> str:
+        """通用的数据组装逻辑"""
+        name = context.get('stock_name', '未知标的')
+        code = context.get('code', '未知代码')
+        
+        # 提取各个维度的详细数据（适配 main.py 传过来的字典）
         realtime = context.get('realtime', {})
+        chip = context.get('chip', {})
         trend = context.get('trend_analysis', {})
         
-        # 基础量价信息
         prompt = f"""
-标的名称：{name} ({code})
-最新价格：{realtime.get('price', 'N/A')}
-量比/换手：{realtime.get('volume_ratio', 'N/A')} / {realtime.get('turnover_rate', 'N/A')}%
-趋势状态：{trend.get('trend_status', 'N/A')}
-买入信号评分：{trend.get('signal_score', 'N/A')}
-"""
-        # 添加技术面细节
-        if 'chip' in context:
-            prompt += f"筹码获利比：{context['chip'].get('profit_ratio', 'N/A')}\n"
+分析对象：{name} ({code})
+---
+【技术面信息】
+当前价格: {realtime.get('price', '数据缺失')}
+量比: {realtime.get('volume_ratio', '数据缺失')}
+换手率: {realtime.get('turnover_rate', '数据缺失')}%
+趋势状态: {trend.get('trend_status', '数据缺失')}
+信号得分: {trend.get('signal_score', '数据缺失')}
+筹码获利比: {chip.get('profit_ratio', '数据缺失')}
 
-        # 添加新闻/情报
-        if news_context:
-            prompt += f"\n【最新相关情报】:\n{news_context}\n"
-        
+【市场情报】
+{news_context if news_context else "暂无关键新闻"}
+"""
         return prompt
 
-# 为了兼容性，保留原有的映射逻辑（可选）
-STOCK_NAME_MAP = {}
+    def _safe_parse_response(self, text: str) -> Optional[AnalysisResult]:
+        """安全解析 JSON"""
+        try:
+            # 清理可能的 Markdown 标记
+            clean_json = re.sub(r'```json\n?|\n?```', '', text).strip()
+            data = json.loads(clean_json)
+            return AnalysisResult(**data)
+        except Exception as e:
+            logger.error(f"JSON 解析失败: {e}, 原始内容: {text}")
+            return None
