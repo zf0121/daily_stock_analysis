@@ -1,40 +1,39 @@
-# data_provider/crypto_fetcher.py
-
 import yfinance as yf
 import pandas as pd
-import logging
 import requests
+import logging
 from typing import Optional
 
+# 配置日志
 logger = logging.getLogger(__name__)
 
 class CryptoFetcher:
     def __init__(self):
-        pass
+        self.fng_url = "https://api.alternative.me/fng/"
 
     def get_crypto_data(self, symbol: str, days: int = 100) -> Optional[pd.DataFrame]:
         """
-        获取加密货币数据并转换为项目通用的 DataFrame 格式
-        :param symbol: 交易对代码，例如 'BTC-USD', 'ETH-USD'
-        :param days: 获取最近多少天的数据
+        获取加密货币K线数据并标准化
+        :param symbol: 交易对名称，如 'BTC-USD', 'ETH-USD'
+        :param days: 获取天数
         """
         try:
-            # yfinance 获取数据
-            # 虚拟货币 7x24，我们获取足够长的数据以计算均线
+            logger.info(f"正在从 yfinance 获取 {symbol} 的K线数据...")
+            # 获取数据，虚拟货币 7x24 交易，无需考虑开盘时间
             df = yf.download(symbol, period=f"{days}d", interval="1d", progress=False)
             
             if df.empty:
-                logger.warning(f"{symbol} 未获取到数据")
+                logger.warning(f"{symbol} 未能获取到数据，请检查代码拼写是否正确（如 BTC-USD）。")
                 return None
 
-            # yfinance 的索引是 Date，需要重置索引并重命名列以匹配原有 AkShare 的格式
+            # 重置索引，将 Date 变为一列
             df = df.reset_index()
             
-            # 扁平化多层索引 (如果 yfinance 返回了多层列名)
+            # 处理 yfinance 可能返回的多级表头 (MultiIndex)
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
 
-            # 标准化列名（原有项目通常使用小写）
+            # 统一列名为小写，适配原项目的 analyzer 逻辑
             df = df.rename(columns={
                 'Date': 'date',
                 'Open': 'open',
@@ -44,85 +43,67 @@ class CryptoFetcher:
                 'Volume': 'volume'
             })
 
-            # 确保日期格式为字符串 YYYY-MM-DD (原有逻辑通常依赖字符串日期)
+            # 将日期转换为字符串 YYYY-MM-DD
             df['date'] = df['date'].dt.strftime('%Y-%m-%d')
             
-            # 计算涨跌幅 (pct_change) 和 涨跌额 (change)
-            # 股市数据通常包含这些，yfinance 需要手动计算
+            # 计算技术指标所需的基础列
             df['change'] = df['close'].diff()
             df['pct_change'] = df['close'].pct_change() * 100
             
-            # 填补 NaN
+            # 填充第一行的 NaN
             df = df.fillna(0)
-
+            
             return df
 
         except Exception as e:
-            logger.error(f"获取 {symbol} 数据失败: {e}")
+            logger.error(f"获取 {symbol} K线数据时发生异常: {str(e)}")
             return None
+
+    def get_onchain_sentiment(self) -> str:
+        """
+        获取加密货币特有的市场情绪面数据（链上及情绪指标）
+        """
+        sentiment_report = "\n【加密货币专项参考数据】\n"
+        
+        # 1. 获取恐慌与贪婪指数 (Fear & Greed Index)
+        try:
+            response = requests.get(self.fng_url, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                fng_val = data['data'][0]['value']
+                fng_class = data['data'][0]['value_classification']
+                sentiment_report += f"- 恐慌贪婪指数: {fng_val} ({fng_class})\n"
+                
+                # 为 AI 提供背景知识建议
+                if int(fng_val) < 25:
+                    sentiment_report += "  (提示: 市场处于极度恐慌状态，通常是潜在的左侧买点)\n"
+                elif int(fng_val) > 75:
+                    sentiment_report += "  (提示: 市场处于极度贪婪状态，需警惕回调风险)\n"
+        except Exception as e:
+            logger.error(f"获取情绪指数失败: {e}")
+            sentiment_report += "- 恐慌贪婪指数: 暂时无法获取\n"
+
+        # 2. 获取大盘参考指标 (以 BTC 为基准)
+        try:
+            btc = yf.Ticker("BTC-USD")
+            # 尝试获取市值等信息 (GitHub Actions 运行环境 IP 有时会被限制获取 info)
+            # 我们通过 history 获取最近两天的收盘价计算简单趋势
+            hist = btc.history(period="2d")
+            if len(hist) >= 2:
+                prev_close = hist['Close'].iloc[0]
+                curr_close = hist['Close'].iloc[1]
+                trend = "上涨" if curr_close > prev_close else "下跌"
+                sentiment_report += f"- BTC大盘24h走势: {trend}\n"
+        except Exception:
+            pass
+
+        return sentiment_report
 
     def get_realtime_price(self, symbol: str) -> float:
-        """获取最新价格"""
+        """获取当前最新实时价格"""
         try:
             ticker = yf.Ticker(symbol)
-            # 获取最新的一分钟数据
             data = ticker.history(period="1d", interval="1m")
-            if not data.empty:
-                return data['Close'].iloc[-1]
-            return 0.0
+            return data['Close'].iloc[-1] if not data.empty else 0.0
         except Exception:
             return 0.0
-try:
-            df = yf.download(symbol, period=f"{days}d", interval="1d", progress=False)
-            if df.empty: return None
-            df = df.reset_index()
-            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-            df = df.rename(columns={'Date': 'date', 'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'})
-            df['date'] = df['date'].dt.strftime('%Y-%m-%d')
-            df['change'] = df['close'].diff()
-            df['pct_change'] = df['close'].pct_change() * 100
-            return df.fillna(0)
-        except Exception as e:
-            logger.error(f"K线数据获取失败: {e}")
-            return None
-
-    def get_onchain_sentiment(self):
-        """
-        获取加密货币市场情绪和基础数据
-        返回一个字符串，可以直接喂给 AI
-        """
-        info_text = ""
-        
-        # 1. 获取恐慌贪婪指数 (免费 API)
-        try:
-            url = "https://api.alternative.me/fng/"
-            response = requests.get(url, timeout=10)
-            data = response.json()
-            if data['metadata']['error'] is None:
-                fng_value = data['data'][0]['value']
-                fng_class = data['data'][0]['value_classification']
-                info_text += f"【市场情绪】当前恐慌贪婪指数为 {fng_value} ({fng_class})。\n"
-                
-                # 简单逻辑判断供 AI 参考
-                if int(fng_value) < 20:
-                    info_text += "注：市场处于极度恐慌，历史上通常是阶段性底部区域。\n"
-                elif int(fng_value) > 80:
-                    info_text += "注：市场处于极度贪婪，历史上需警惕回调风险。\n"
-        except Exception as e:
-            logger.error(f"恐慌指数获取失败: {e}")
-
-        # 2. 获取比特币市占率 (通过 yfinance 简易获取)
-        # 很多时候 BTC.D (市占率) 上涨意味着吸血行情，山寨币会跌
-        try:
-            # 获取 BTC 市值和 ETH 市值来做一个简单的对比
-            btc_ticker = yf.Ticker("BTC-USD")
-            btc_info = btc_ticker.info
-            # 注意：Github Actions IP 可能获取不到详细 info，如果获取不到会跳过
-            if 'marketCap' in btc_info and btc_info['marketCap']:
-                mcap = btc_info['marketCap'] / 1000000000 # 转为十亿美元
-                vol24 = btc_info.get('volume24Hr', 0) / 1000000000
-                info_text += f"【链上/市场数据】BTC市值: ${mcap:.2f}B, 24h交易量: ${vol24:.2f}B。\n"
-        except Exception:
-            pass # 忽略错误
-
-        return info_text
